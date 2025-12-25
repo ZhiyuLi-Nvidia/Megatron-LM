@@ -2055,6 +2055,9 @@ def get_batch_on_this_cp_rank(
                 index[1].fill_(2 * cp_size - cp_rank - 1)
                 val = val.index_select(seq_dim, index)
                 val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+                # Make contiguous to avoid views being passed to pipeline parallel
+                # which would trigger assertion in deallocate_output_tensor
+                val = val.contiguous()
                 batch[key] = val
 
     return batch
