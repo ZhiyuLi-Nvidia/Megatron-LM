@@ -862,9 +862,14 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs.unsqueeze(-1), actual_tokens_per_expert
-            )
+            orig_dtype = permuted_probs.dtype
+            if orig_dtype == torch.float64:
+                permuted_probs = permuted_probs.unsqueeze(-1).view(torch.float32)
+            else:
+                permuted_probs = permuted_probs.unsqueeze(-1)
+            permuted_probs, _ = self.quantization_padding(permuted_probs, actual_tokens_per_expert)
+            if orig_dtype == torch.float64:
+                permuted_probs = permuted_probs.view(orig_dtype)
         else:
             permuted_probs = permuted_probs.unsqueeze(-1)
 
