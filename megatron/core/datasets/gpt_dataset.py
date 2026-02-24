@@ -708,6 +708,8 @@ class MockGPTLowLevelDataset:
 
     def __init__(self, tokenizer: MegatronTokenizerBase) -> None:
         self.tokenizer = tokenizer
+        self.vocab_size = tokenizer.vocab_size
+        print(f"[MockGPTLowLevelDataset] Using uniform random token IDs in [0, {self.vocab_size - 1})")
         rng = numpy.random.default_rng(seed=self.seed)
         self.sequence_lengths = rng.integers(
             low=1, high=self.max_sequence_length, size=self.size, dtype=numpy.int32
@@ -718,9 +720,9 @@ class MockGPTLowLevelDataset:
 
     def __getitem__(self, idx: int) -> numpy.number:
         length = self.sequence_lengths[idx]
-        sample = numpy.int64(
-            numpy.concatenate([numpy.arange(length - 1) + 1, [self.tokenizer.eod]])
-        )
+        rng = numpy.random.default_rng(seed=self.seed + idx)
+        tokens = rng.integers(low=0, high=self.vocab_size - 1, size=length - 1, dtype=numpy.int64)
+        sample = numpy.concatenate([tokens, numpy.array([self.tokenizer.eod], dtype=numpy.int64)])
         return sample
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
