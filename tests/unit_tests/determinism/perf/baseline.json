@@ -1,0 +1,8 @@
+{
+  "dsv-like-tp2-ep2": {
+    "backward_ms": 125.45404950310203,
+    "forward_ms": 73.93525247012867,
+    "max_allocated_bytes": 19518224076.8,
+    "max_regression_ratio": 1.02
+  }
+}

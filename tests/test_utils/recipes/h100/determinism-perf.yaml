@@ -1,0 +1,91 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "determinism_perf_{environment}_{platforms}"
+  model: unit-tests
+  nodes: 1
+  build: mcore-pyt-{environment}
+  gpus: 8
+  platforms: dgx_h100
+  script_setup: |
+    unset https_proxy
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+  script: |-
+    set -euo pipefail
+    # nsys-wrapped determinism perf:
+    # - For each mode (det, nondet) wrap pytest in nsys profile with
+    #   --capture-range=cudaProfilerApi so only the active iters (between
+    #   PerfRunner's cudaProfilerStart/Stop) are collected.
+    # - --capture-range-end=stop-shutdown keeps capture open for all 8
+    #   ranks even after rank 0 calls cudaProfilerStop (with the bare
+    #   ``stop`` form, the first rank's Stop ends capture for everyone).
+    # - After each pytest finishes, dump nvtx_sum to CSV.
+    # - Finally, print_nsys_leaderboard joins det+nondet CSVs and prints
+    #   the side-by-side per-NVTX-range comparison.
+    cd /opt/megatron-lm
+    LEADERBOARD_DIR="{assets_dir}/logs/perf-leaderboards"
+    mkdir -p "$LEADERBOARD_DIR"
+
+    for MODE in det nondet; do
+      export DETERMINISM_PERF_MODE=$MODE
+      export DETERMINISM_PERF_LEADERBOARD_DIR="$LEADERBOARD_DIR"
+      NSYS_REP="$LEADERBOARD_DIR/nsys-$MODE"
+
+      # SLURM time_limit (3600s) handles per-job timeout; no pytest
+      # --timeout flags here (would require pytest-timeout plugin).
+      nsys profile \
+        --sample=none --cpuctxsw=none -t cuda,nvtx \
+        -f true -x true --cuda-graph-trace=node \
+        --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown \
+        -o "$NSYS_REP" \
+        uv run --no-sync python -m torch.distributed.run \
+          --log-dir "{assets_dir}/logs/$MODE" \
+          --tee "0:3,7:3" \
+          --redirects "3" \
+          --nproc_per_node 8 \
+          -m pytest -q -s -rA \
+            tests/unit_tests/determinism/perf/
+
+      nsys stats --report nvtx_sum --format csv "$NSYS_REP.nsys-rep" > "$NSYS_REP.csv"
+      # Fail loudly if the CSV has only a header (or is empty) so a silent
+      # nsys collection failure surfaces here instead of downstream as
+      # "need both for join". Use a paren subshell (NOT a curly-brace
+      # group) for the failure clause: the recipe script body is run
+      # through Python str.format by launch_nemo_run_workload.py, which
+      # interprets unescaped curly braces as format placeholders.
+      [ "$(wc -l < "$NSYS_REP.csv")" -ge 2 ] || \
+        ( echo "ERROR: empty or header-only $NSYS_REP.csv"; exit 1 )
+    done
+
+    uv run --no-sync python \
+      tests/unit_tests/determinism/perf/print_nsys_leaderboard.py \
+      "$LEADERBOARD_DIR"
+
+products:
+  # ``test_case`` is required so the GitHub-Actions unit-tests matrix in
+  # ``.github/workflows/cicd-main.yml`` can extract a bucket name from
+  # this recipe alongside ``unit-tests.yaml``. ``**/*.py`` glob matches
+  # the convention used by every other entry in ``unit-tests.yaml``.
+  - test_case: [tests/unit_tests/determinism/perf/**/*.py]
+    products:
+      # ``environment: [lts, dev]`` matches every other unit-tests entry —
+      # action.yml hardcodes ``--environment dev`` and ``recipe_parser``
+      # filters by strict ==, so an lts-only recipe is filtered to 0
+      # workloads and the launcher's ``assert len(workloads) == 1`` fails
+      # before nsys ever starts.
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [3600]
