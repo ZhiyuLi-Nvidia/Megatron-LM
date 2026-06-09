@@ -997,6 +997,9 @@ class _HybridEPManager(_DispatchManager):
         self.handle = None
         # Used for padding the output for each expert
         self.pad_multiple = None
+        # Per-manager HybridEPBuffer key — avoids the shared-singleton race
+        # between VP chunks under interleaved 1F1B (see fused_a2a.py).
+        self._buffer_key = id(self)
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -1046,6 +1049,7 @@ class _HybridEPManager(_DispatchManager):
                 probs=self.token_probs,
                 group=self.group,
                 num_local_experts=self.num_local_experts,
+                buffer_key=self._buffer_key,
                 num_sms_dispatch_api=self.config.moe_hybridep_num_sms,
                 num_sms_combine_api=self.config.moe_hybridep_num_sms,
                 num_permuted_tokens=self.num_permuted_tokens,
@@ -1069,6 +1073,7 @@ class _HybridEPManager(_DispatchManager):
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
+            buffer_key=self._buffer_key,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
