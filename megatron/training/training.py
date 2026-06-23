@@ -1780,8 +1780,78 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+# ---------------------------------------------------------------------------
+# RACE_NOISE: scheduling-noise injection for determinism reproducer tests.
+#
+# When env var ``RACE_NOISE=1`` is set, ``train_step`` is wrapped with a
+# per-rank seeded side-stream GEMM noise generator. Same design as the
+# standalone determinism-tests branch's ``RacingStreams`` in
+# ``tests/unit_tests/determinism/utils.py`` — fresh instance per step so
+# paired runs A and B see IDENTICAL noise per rank (different across ranks).
+# Effective only with ``CUDA_DEVICE_MAX_CONNECTIONS > 1``.
+#
+# No-op when ``RACE_NOISE`` is unset/0 — production training path is
+# unchanged.
+# ---------------------------------------------------------------------------
+class _RaceNoiseStreams:
+    _SIZE_CHOICES = (1024, 2048, 3072)
+    _RANK_STREAM_CYCLE = 4
+    _STREAM_PRIORITIES = (-1, 0)
+    _BASE_SEED = 0xC0FFEE
+
+    def __init__(self, num_streams: int = 4, num_iters: int = 200):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        self.num_streams = num_streams + (rank % self._RANK_STREAM_CYCLE)
+        self.num_iters = num_iters
+        self._gen = torch.Generator()
+        self._gen.manual_seed(self._BASE_SEED + rank)
+        self.streams: list = []
+        self._noise: list = []
+
+    def __enter__(self):
+        self.streams = [
+            torch.cuda.Stream(priority=self._STREAM_PRIORITIES[i % len(self._STREAM_PRIORITIES)])
+            for i in range(self.num_streams)
+        ]
+        for stream in self.streams:
+            with torch.cuda.stream(stream):
+                size_indices = torch.randint(
+                    0, len(self._SIZE_CHOICES), (self.num_iters,), generator=self._gen
+                ).tolist()
+                result = None
+                for idx in size_indices:
+                    sz = self._SIZE_CHOICES[idx]
+                    a = torch.ones(sz, sz, device="cuda", dtype=torch.bfloat16)
+                    b = torch.ones(sz, sz, device="cuda", dtype=torch.bfloat16)
+                    result = a @ b
+                if result is not None:
+                    self._noise.append(result)
+        return self
+
+    def __exit__(self, *args):
+        for stream in self.streams:
+            stream.synchronize()
+        self.streams.clear()
+        self._noise.clear()
+
+
+def _maybe_race_noise():
+    if os.environ.get("RACE_NOISE", "0").strip() != "1":
+        return nullcontext()
+    return _RaceNoiseStreams(num_streams=4)
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
-    """Single training step."""
+    """Single training step.
+
+    When ``RACE_NOISE=1`` env var is set, wraps the step body with per-rank
+    seeded side-stream GEMM noise (see ``_maybe_race_noise``).
+    """
+    with _maybe_race_noise():
+        return _train_step_inner(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration)
+
+
+def _train_step_inner(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     args = get_args()
     timers = get_timers()
 

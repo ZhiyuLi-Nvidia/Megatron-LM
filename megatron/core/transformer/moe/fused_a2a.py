@@ -13,9 +13,22 @@ try:
 except ImportError:
     HAVE_DEEP_EP = False
 
+import os
 import torch
 
 _buffer = None
+
+# HYBRIDEP_SYNC env knob (default "1" = sync after every dispatch/combine).
+# At 8-GPU GB200 the synchronize was needed to avoid cudaErrorIllegalAddress
+# in backward after the custom_allgather=False patch unmasked a cross-stream
+# race. Set HYBRIDEP_SYNC=0 to test whether the race fires at 256-GPU too,
+# or whether it's masked at scale by NCCL-collective barriers / DP averaging.
+_HYBRIDEP_SYNC_ENABLED = os.environ.get("HYBRIDEP_SYNC", "1").strip() != "0"
+
+
+def _hybridep_maybe_sync():
+    if _HYBRIDEP_SYNC_ENABLED:
+        torch.cuda.synchronize()
 
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
@@ -298,6 +311,13 @@ def init_hybrid_ep_buffer(
         ...
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
+    # enable_custom_allgather: 26.02 container's DeepEP defaulted this to False;
+    # 26.04 flipped the default to True. The custom-allgather path is the new
+    # culprit for the -4 dim crash under torch.use_deterministic_algorithms(True)
+    # — it appears to skip populating num_dispatched_tokens_tensor before
+    # executor.cu's `.item<int>()` blocking read, leaving uninitialized memory
+    # that reads as -4 (or 0xFFFFFFFC). Force False to match 26.02 behavior
+    # where HybridEP+det reached iter 6 successfully (per 2602 doc).
     _hybrid_ep_buffers[buffer_key] = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -306,6 +326,7 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        enable_custom_allgather=False,
     )
 
 
@@ -367,10 +388,28 @@ class HybridEPDispatch(torch.autograd.Function):
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
         )
+        # When non_blocking=True the HybridEP runtime writes the dispatch outputs on
+        # its internal comm stream and returns before the write completes.  Any CUDA
+        # operation on the returned tensors that is launched on the current (default)
+        # stream will race against that still-in-flight write → cudaErrorIllegalAddress.
+        # Inserting a full device synchronize here is the simplest safe fix: it ensures
+        # every in-flight comm-stream kernel has completed before autograd or the expert
+        # matmuls touch the output storage.
+        # NOTE: this is intentionally heavier than record_stream — record_stream only
+        # prevents the *allocator* from recycling the buffer, it does not prevent the
+        # current stream from reading a partially-written tensor.
+        if non_blocking:
+            _hybridep_maybe_sync()
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.buffer = buffer
+        # record_stream: belt-and-suspenders on top of the synchronize above; keeps
+        # the allocator from recycling the storage across future stream events.
+        _cur = torch.cuda.current_stream()
+        for _t in (dispatched_hidden, dispatched_probs, dispatched_scaling_factor, tokens_per_expert):
+            if isinstance(_t, torch.Tensor) and _t.is_cuda:
+                _t.record_stream(_cur)
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -388,6 +427,14 @@ class HybridEPDispatch(torch.autograd.Function):
         combined_hidden, combined_probs = ctx.buffer.combine_with_unpermute(
             hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
+        # combine_with_unpermute may write on the HybridEP comm stream; synchronize
+        # before the upstream autograd nodes (running on current stream) read the result.
+        _hybridep_maybe_sync()
+        # record_stream: belt-and-suspenders after the synchronize.
+        _cur = torch.cuda.current_stream()
+        for _t in (combined_hidden, combined_probs):
+            if isinstance(_t, torch.Tensor) and _t.is_cuda:
+                _t.record_stream(_cur)
         return combined_hidden, None, combined_probs, None, None, None, None, None, None, None, None
 
 
@@ -406,10 +453,16 @@ class HybridEPCombine(torch.autograd.Function):
         combined_hidden, _ = buffer.combine_with_unpermute(
             hidden=x, handle=handle, pad_multiple=pad_multiple
         )
+        # combine_with_unpermute may write on the HybridEP comm stream; synchronize
+        # before downstream computation (running on current stream) reads the result.
+        _hybridep_maybe_sync()
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
         ctx.buffer = buffer
+        # record_stream: belt-and-suspenders after the synchronize.
+        if isinstance(combined_hidden, torch.Tensor) and combined_hidden.is_cuda:
+            combined_hidden.record_stream(torch.cuda.current_stream())
         return combined_hidden
 
     @staticmethod
@@ -418,6 +471,7 @@ class HybridEPCombine(torch.autograd.Function):
         Backward pass of fused combine of the HybridEP backend
         '''
         handle = ctx.handle
+        _non_blocking = ctx.num_permuted_tokens is not None
         dispatched_hidden, _, _, _, _ = ctx.buffer.dispatch_with_permute(
             hidden=grad_x,
             scaling_factor=None,
@@ -425,6 +479,13 @@ class HybridEPCombine(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
         )
+        # Same sync rationale as HybridEPDispatch.forward: if dispatch was async, the
+        # backward comm stream must be drained before the upstream grad computation
+        # (which runs on the current stream) reads dispatched_hidden.
+        if _non_blocking:
+            _hybridep_maybe_sync()
+        if isinstance(dispatched_hidden, torch.Tensor) and dispatched_hidden.is_cuda:
+            dispatched_hidden.record_stream(torch.cuda.current_stream())
         return dispatched_hidden, None, None, None, None, None
 
 
