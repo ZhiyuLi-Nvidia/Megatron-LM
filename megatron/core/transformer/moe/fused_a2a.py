@@ -310,6 +310,12 @@ def init_hybrid_ep_buffer(
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    # 26.04 DeepEP flipped HybridEPBuffer.enable_custom_allgather default
+    # from False → True.  The new custom-allgather path leaves
+    # num_dispatched_tokens_tensor uninitialised before executor.cu blocking-
+    # reads it via .item<int>(); the host then reads -4 (0xFFFFFFFC) and a
+    # downstream tensor allocation asserts with "negative dimension -4".
+    # Forcing False here restores 26.02 behaviour.
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -318,6 +324,7 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        enable_custom_allgather=False,
     )
 
 
