@@ -25,3 +25,8 @@ docs/apidocs
 # Git worktrees
 .worktrees/
 .claude/worktrees/
+.slurm-bridge/
+
+# Local secrets — real keys live in ../secrets.sh (outside the repo). This guards
+# against a copy landing in the repo; secrets.sh.example (template) stays tracked.
+secrets.sh

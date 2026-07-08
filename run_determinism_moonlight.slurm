@@ -37,7 +37,12 @@
 #SBATCH --partition=batch
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
+# Request GPUs via --gres (proven on this cluster by NeMo-Run's generated sbatch,
+# ~/.nemo_run/experiments/.../*_sbatch.sh). --gpus-per-node can under-allocate to
+# 1 GPU here (see Megatron-Bridge scripts/performance/utils/executors.py); --gres
+# + --exclusive reliably gives all 4 GB200 GPUs on the node.
+#SBATCH --gres=gpu:4
+#SBATCH --exclusive
 #SBATCH --time=01:00:00
 #SBATCH --mem=0
 #SBATCH --output=/lustre/fsw/portfolios/llmservice/users/zhiyul/det-adhoc/logs/%x-%j.out
@@ -103,6 +108,14 @@ run_once () {
        --no-container-mount-home --export=ALL,HOME=/tmp \
        bash -c '
          export PYTHONPATH=/opt/megatron-lm
+         # From the proven GB200 NeMo-Run sbatch (~/.nemo_run/experiments/.../*_sbatch.sh):
+         # NVLS/SHARP off is determinism defense-in-depth (Ring is the deterministic
+         # allreduce; NVLS could otherwise be selected) and also saves memory; the
+         # expandable allocator reduces fragmentation OOM for a 16B model on 4 GPUs.
+         # The core determinism env (NCCL_ALGO=Ring, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0,
+         # CUBLAS_WORKSPACE_CONFIG) is set by the branch under test, so it is NOT exported here.
+         export NCCL_NVLS_ENABLE=0
+         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
          python -m torch.distributed.run \
            --nnodes=${NNODES} --nproc-per-node=${GPUS_PER_NODE} \
            --node-rank=${SLURM_NODEID} \
