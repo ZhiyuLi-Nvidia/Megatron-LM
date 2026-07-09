@@ -12,7 +12,10 @@ echo "submitted $jobid -> $log"
 
 while :; do
   if result=$(grep -m1 "RESULT: DETERMINISM" "$log" 2>/dev/null); then
-    echo; echo "$result"; [[ "$result" == *PASS* ]]; exit
+    echo; echo "$result"
+    links=$(grep -oE "https://wandb\.ai/\S+/runs/\S+" "$log" 2>/dev/null | sort -u)
+    if [ -n "$links" ]; then echo "wandb runs:"; echo "$links" | sed 's/^/  /'; else echo "wandb: offline/disabled"; fi
+    [[ "$result" == *PASS* ]]; exit
   fi
   ts=$(date +%H:%M:%S)
   if [ -f "$log" ]; then
