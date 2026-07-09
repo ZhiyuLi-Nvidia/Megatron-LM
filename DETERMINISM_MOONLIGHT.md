@@ -2,7 +2,8 @@
 
 A bit-exact-reproducibility check for a DeepSeek-V3-architecture MoE
 (Moonshot AI's **Moonlight-16B-A3B**: Multi-Latent Attention + fine-grained MoE)
-on **one GB200 node (4 GPUs)** at **TP2 / PP1 / EP2**.
+on **2 GB200 nodes (2 GPUs each)** at **TP2 / PP1 / EP2**, with run1 and run2
+running **in parallel** (one per node), so wall time is a single run's.
 
 - **Step 1** — one valid end-to-end run.
 - **Step 2** — a second run; assert the per-step `lm loss` is bit-identical across the two.
@@ -78,15 +79,20 @@ grouped GEMM, `alltoall` dispatcher. No MTP. rotary base 50000, RMSNorm.
 Training args (seq/iters/batch) are shrunk for a fast local check; the
 architecture is unchanged. `--mock-data` + `NullTokenizer`, so no dataset needed.
 
-## Parallelism (4 GPUs)
+## Parallelism (2 nodes × 2 GPUs, parallel)
+
+Each run uses 2 GPUs on its own node:
 
 ```
-TP=2, PP=1, CP=1  ->  DP = 4 / (2*1*1) = 2
-EP=2, ETP=1       ->  expert-DP = 2        (num-experts 64 % EP == 0)
+TP=2, PP=1, CP=1  ->  DP = 2 / (2*1*1) = 1
+EP=2, ETP=1       ->  expert-DP = 1        (num-experts 64 % EP == 0)
 ```
 
-GPUs are requested with `--gres=gpu:4 --exclusive` (on this cluster
-`--gpus-per-node` can under-allocate to a single GPU).
+The job books `--nodes=2 --gres=gpu:2 --exclusive` (use `--gres`, not
+`--gpus-per-node`, which can under-allocate to a single GPU on this cluster) and
+launches run1 on node 0 and run2 on node 1 **simultaneously** (`srun --nodelist
+--overlap … &` then `wait`). Determinism is preserved: the two runs are separate
+processes on separate nodes/GPUs/NCCL-communicators with no shared state.
 
 ## What makes it deterministic
 
