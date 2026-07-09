@@ -14,11 +14,12 @@ while :; do
   if result=$(grep -m1 "RESULT: DETERMINISM" "$log" 2>/dev/null); then
     echo; echo "$result"; [[ "$result" == *PASS* ]]; exit
   fi
+  ts=$(date +%H:%M:%S)
   if [ -f "$log" ]; then
     prog=$(grep -oE "iteration +[0-9]+/ *[0-9]+.*lm loss: [0-9.eE+-]+" "$log" | tail -1)
-    echo "[$(date +%H:%M:%S)] ${prog:-initializing...}"
+    echo "[$ts] ${prog:-initializing...}"
   else
-    echo "[$(date +%H:%M:%S)] queued: $(squeue -j "$jobid" -h -o '%T (%r)' 2>/dev/null || echo '?')"
+    echo "[$ts] queued: $(squeue -j "$jobid" -h -o '%T (%r)' 2>/dev/null || echo '?')"
   fi
   sleep 30
 done
