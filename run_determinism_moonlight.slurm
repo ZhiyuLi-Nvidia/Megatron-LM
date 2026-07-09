@@ -43,7 +43,12 @@
 set -uo pipefail
 
 WORKDIR=/lustre/fs1/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/zhiyul/Megatron-LM
-SQSH=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/megatron_rl/adlr+megatron-rl+arm64-260407.sqsh
+# Container squashfs (enroot). Override to test another image, e.g. the release
+# NeMo container imported via ~/.bashrc's enroot-image-local:
+#   IMG=nvcr.io#nvidia/nemo:26.06 enroot-image-local   # -> ...enroot-images/nvcr.io+nvidia+nemo+26.06.<date>.squashfs
+#   SQSH=/lustre/fsw/portfolios/llmservice/users/$USER/enroot-images/nvcr.io+nvidia+nemo+26.06.<date>.squashfs sbatch run_determinism_moonlight.slurm
+# Must be arm64 (GB200 = Grace ARM). Default is the proven arm64 megatron-rl dev image.
+SQSH=${SQSH:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/megatron_rl/adlr+megatron-rl+arm64-260407.sqsh}
 OUT=/lustre/fsw/portfolios/llmservice/users/zhiyul/det-adhoc/moonlight-${SLURM_JOB_ID}
 mkdir -p "$OUT"
 
