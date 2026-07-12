@@ -24,7 +24,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.bit_exact_runner import BitExactRunner
 from tests.unit_tests.determinism.configs import hybrid_base
 from tests.unit_tests.determinism.correctness.test_hybrid_model import (
-    _MICRO_BATCH,
     _SEQ_LEN,
     _VOCAB_SIZE,
     _hybrid_inputs,
@@ -59,7 +58,9 @@ class TestHybridMoEScanDeterminism:
     @pytest.mark.internal
     @pytest.mark.parametrize("parallelism", _EP_CELLS)
     def test_bit_exact_mamba_moe_ep(self, parallelism):
-        def build(overrides, pre_process=True, post_process=True, vp_stage=None, **_):
+        # No PP/VPP in _EP_CELLS, so the runner always takes the naive path: pre/post_process
+        # are always True and vp_stage None — let HybridModel defaults apply.
+        def build(overrides, **_):
             cfg = TransformerConfig(**(hybrid_base() | overrides))
             return HybridModel(
                 config=cfg,
@@ -67,17 +68,14 @@ class TestHybridMoEScanDeterminism:
                 vocab_size=_VOCAB_SIZE,
                 max_sequence_length=_SEQ_LEN,
                 hybrid_layer_pattern=_LAYER_PATTERN,
-                pre_process=pre_process,
-                post_process=post_process,
-                vp_stage=vp_stage,
             ).cuda()
 
+        # seq_len/micro_batch are only read by the pipeline path (PP>1), which _EP_CELLS
+        # never trigger — omit them.
         runner = BitExactRunner(
             build_model=build,
             make_inputs=_hybrid_inputs,
             base_config=hybrid_base,
             supports_pp=False,
-            seq_len=_SEQ_LEN,
-            micro_batch=_MICRO_BATCH,
         )
         runner.run({}, parallelism)

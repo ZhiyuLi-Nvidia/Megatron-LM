@@ -1,36 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Repro: the Mamba2 SSD selective-scan fused kernel is non-deterministic (at a55b's TP).
+"""The Mamba2 SSD selective-scan kernel is deterministic ONLY under the deterministic-mode
+autotune pin; without it two independent processes can diverge (the a55b break).
 
-The a55b HybridEP determinism break was localized (op-level A/A trace) to
-``mamba_chunk_scan_combined_varlen`` in ``megatron/core/ssm/ops/ssd_combined.py``:
-bit-identical inputs, different SSM-state output across two independent runs, which then
-compounds into the divergent loss. The existing determinism suite never catches this
-because (1) no SSM model is in its matrix and (2) ``BitExactRunner._two_runs`` reruns
-*in the same process under a restored RNG state*, so Triton's cached autotune config
-carries over between the two runs and masks the divergence.
+Mechanism: the scan is Triton-autotuned; independent processes can benchmark and pick
+different configs -> different reduction order -> ~1e-5 divergence. ``--deterministic-mode``
+makes ``megatron/core/ssm/ops/determinism.py::autotune_configs`` collapse to one fixed
+config, so every process matches. Full forensics + a55b context: ``det_boot/FINDINGS.md``.
 
-a55b runs **TP=2**, so each rank's Mamba mixer runs the scan on a head-shard
-(``nheads / TP``). These tests reproduce at that same geometry — the scan is TP-local
-(no cross-rank comm inside it), so "TP=2" means each rank runs the kernel on
-``_NHEADS_TOTAL / 2`` heads:
+What this file asserts (via two independent ``torchrun`` jobs compared by fp64 fingerprint;
+the suite's same-process ``BitExactRunner`` masks this because run 2 reuses run 1's warm
+autotune cache):
+  * det ON  -> bit-identical across runs (hard guard).
+  * det OFF -> may diverge (xfail demo; XPASS when the break reproduces, autotune-cache-dependent).
 
-* ``test_scan_deterministic_across_tp2_processes`` — two *independent*
-  ``torchrun --nproc_per_node=2`` jobs (TP=2). Each job autotunes the scan on its own;
-  comparing their all-reduced output fingerprint is the production A/A condition the
-  same-process harness cannot reproduce. **This is the faithful repro.** (Needs 2 GPUs.)
-* ``test_scan_deterministic_same_process`` — cheap 1-GPU guard: relaunch on the TP=2
-  per-rank shard in one process (catches the atomic-accumulation component).
-* ``test_autotune_configs_deterministic_selection`` — unit-covers
-  ``megatron/core/ssm/ops/determinism.py`` (previously referenced by no test).
-
-The two kernel tests are ``xfail(strict=False)``: they document a live bug and flip to
-XPASS once the deterministic scan path (the currently-dead ``alloc_tile_workspace`` /
-``finalize_tile_workspace`` atomic-free reduction in ``determinism.py``) is wired in.
-
-Run on a GPU node::
-
-    pytest tests/unit_tests/determinism/correctness/test_ssd_scan_determinism.py
+Run: ``uv run --no-sync python -m pytest <this file> -s -v`` on a GPU node.
 """
 
 import os
@@ -57,14 +41,14 @@ except Exception:
     HAVE_SSD_KERNEL = False
 
 
-# a55b parallelism: TP=2. The Mamba mixer shards heads across TP, so one rank runs the
-# scan on _NHEADS_TOTAL / _TP heads. Geometry mirrors the a55b Mamba2 mixer at toy scale;
-# a multi-chunk (4-chunk) scan so the chunk-state / state-passing reductions actually run.
+# a55b parallelism: TP=2. The Mamba mixer shards heads across TP, so one rank runs the scan
+# on _NHEADS_TOTAL / TP heads. Geometry is a numerically-stable multi-chunk scan large
+# enough to exercise the chunk-state / state-passing reductions where cross-process autotune
+# divergence appears (an 8-chunk, 16-head scan reproduces it; a 4-chunk toy scan does not).
 _TP = 2
-_NHEADS_TOTAL = 8
-_NHEADS_LOCAL = _NHEADS_TOTAL // _TP  # per-rank head-shard under TP=2
-_CHUNK = 16
-_SEQLEN = 64  # 4 chunks
+_NHEADS_TOTAL = 16
+_CHUNK = 128
+_SEQLEN = 1024  # 8 chunks
 _HEADDIM = 64
 _NGROUPS = 1
 _DSTATE = 128
@@ -72,18 +56,19 @@ _SEED = 1234
 
 
 def _scan_output_fingerprint(nheads: int, seed: int) -> tuple[float, float]:
-    """Run the varlen SSD scan once on fixed seeded inputs of ``nheads`` heads; return
-    fp64 sums of the token output and the final SSM states.
+    """Run the varlen SSD scan once on fixed seeded, numerically-stable inputs; return fp64
+    sums of the token output and the final SSM states.
 
-    Inputs are seeded, so any change in the returned pair between runs is the kernel's
-    own non-determinism (the exact two tensors that diverged in the a55b trace).
+    Inputs are seeded, so any change in the returned pair between runs is the kernel's own
+    non-determinism. ``A`` is a negative decay and ``dt`` is small (matching real Mamba) so
+    the scan stays finite instead of overflowing to NaN.
     """
     torch.manual_seed(seed)
     dev = torch.device("cuda")
     nchunks = _SEQLEN // _CHUNK
     x = torch.randn(_SEQLEN, nheads, _HEADDIM, device=dev, dtype=torch.float32)
-    dt = torch.randn(_SEQLEN, nheads, device=dev, dtype=torch.float32)
-    A = torch.randn(nheads, device=dev, dtype=torch.float32)
+    dt = torch.rand(_SEQLEN, nheads, device=dev, dtype=torch.float32) * 0.05
+    A = -torch.rand(nheads, device=dev, dtype=torch.float32) - 0.5
     B = torch.randn(_SEQLEN, _NGROUPS, _DSTATE, device=dev, dtype=torch.float32)
     C = torch.randn(_SEQLEN, _NGROUPS, _DSTATE, device=dev, dtype=torch.float32)
     out = torch.empty(_SEQLEN, nheads, _HEADDIM, device=dev, dtype=torch.float32)
@@ -107,77 +92,76 @@ def _scan_output_fingerprint(nheads: int, seed: int) -> tuple[float, float]:
     return out.double().sum().item(), states.double().sum().item()
 
 
+def _run_independent_job(tp: int, deterministic: bool) -> str:
+    """Launch one independent ``torchrun`` job at the given TP and determinism setting;
+    return its printed scan fingerprint. A fresh process => fresh Triton autotune, so this
+    is the production A/A condition (two of these compared)."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={tp}",
+            __file__,
+            "--worker",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "SSD_DET": "1" if deterministic else "0"},
+    )
+    assert proc.returncode == 0, f"torchrun worker failed:\n{proc.stderr}"
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("FINGERPRINT ")]
+    assert lines, f"no fingerprint printed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    return lines[-1]
+
+
+def _two_runs(tp: int, deterministic: bool) -> tuple[str, str]:
+    """Fingerprints of two *independent* torchrun jobs (skips if too few GPUs)."""
+    if torch.cuda.device_count() < tp:
+        pytest.skip(f"needs {tp} GPU(s) for TP={tp}")
+    return _run_independent_job(tp, deterministic), _run_independent_job(tp, deterministic)
+
+
 @pytest.mark.internal
-@pytest.mark.xfail(
-    strict=False,
-    reason="SSD scan diverges across independent TP=2 runs (independent autotune / atomic "
-    "reductions) — a55b FINDINGS; XPASS once the deterministic scan path is wired.",
-)
 @pytest.mark.skipif(not HAVE_SSD_KERNEL, reason="SSD ops (Triton 3+) unavailable")
-@pytest.mark.skipif(torch.cuda.device_count() < _TP, reason=f"needs {_TP} GPUs for TP={_TP}")
-def test_scan_deterministic_across_tp2_processes():
-    """Two independent TP=2 jobs must produce the same all-reduced scan fingerprint — the
-    production A/A condition the same-process harness can't reproduce (its cached autotune
-    config carries over)."""
-
-    def run_once() -> str:
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "torch.distributed.run",
-                "--standalone",
-                f"--nproc_per_node={_TP}",
-                __file__,
-                "--worker",
-            ],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "MAMBA_DETERMINISTIC": "1"},
-        )
-        assert proc.returncode == 0, f"torchrun worker failed:\n{proc.stderr}"
-        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("FINGERPRINT ")]
-        assert lines, f"no fingerprint printed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
-        return lines[-1]
-
-    run_a = run_once()
-    run_b = run_once()
+@pytest.mark.parametrize("tp", [1, 2])
+def test_scan_deterministic_with_deterministic_mode(tp):
+    """With deterministic mode ON, two independent TP={tp} runs are BIT-IDENTICAL — the fix.
+    ``autotune_configs`` pins the scan to one Triton config, so every process matches."""
+    run_a, run_b = _two_runs(tp, deterministic=True)
+    print(f"\n[SSD-scan, det ON] TP={tp}\n  run1={run_a}\n  run2={run_b}")
     assert run_a == run_b, (
-        "SSD scan fingerprint differs across two independent TP=2 runs:\n"
-        f"  run1={run_a}\n  run2={run_b}"
+        f"deterministic mode must make the SSD scan bit-reproducible across independent "
+        f"TP={tp} runs, but they differed:\n  run1={run_a}\n  run2={run_b}"
     )
 
 
 @pytest.mark.internal
 @pytest.mark.xfail(
     strict=False,
-    reason="SSD scan is non-deterministic on relaunch until the atomic-free tile reduction "
-    "in ssm/ops/determinism.py is wired in (a55b FINDINGS); XPASS once fixed.",
+    reason="Without the autotune pin the scan's cross-run reproducibility is Triton-autotune-"
+    "cache-dependent: it diverges with cold/independent autotune (the a55b A/A condition) and "
+    "agrees once the config is cached/shared. Demonstration, not a hard guarantee — XPASS when "
+    "the break reproduces, XFAIL when the cache masks it.",
 )
 @pytest.mark.skipif(not HAVE_SSD_KERNEL, reason="SSD ops (Triton 3+) unavailable")
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_scan_deterministic_same_process():
-    """Cheap 1-GPU guard: the scan on the TP=2 per-rank shard must be bit-identical when
-    relaunched on identical inputs."""
-    ssd_det.set_deterministic_mode(True)
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    try:
-        ref = _scan_output_fingerprint(nheads=_NHEADS_LOCAL, seed=_SEED)
-        for i in range(8):
-            got = _scan_output_fingerprint(nheads=_NHEADS_LOCAL, seed=_SEED)
-            assert got == ref, (
-                f"SSD scan output changed on relaunch {i} within one process: "
-                f"ref={ref} got={got}"
-            )
-    finally:
-        ssd_det.set_deterministic_mode(None)
+def test_scan_may_diverge_without_deterministic_mode():
+    """Demonstration of the break at a55b's TP: with deterministic mode OFF, two independent
+    runs of the SSD scan CAN diverge (different autotune config -> different reduction)."""
+    run_a, run_b = _two_runs(_TP, deterministic=False)
+    print(f"\n[SSD-scan, det OFF] TP={_TP}\n  run1={run_a}\n  run2={run_b}")
+    assert run_a != run_b, (
+        f"scan agreed across independent TP={_TP} runs with deterministic mode OFF "
+        f"({run_a}) — autotune cache masked the divergence here (see xfail reason)."
+    )
 
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_SSD_DET, reason="ssm.ops.determinism unavailable")
 def test_autotune_configs_deterministic_selection():
-    """Deterministic mode must collapse Triton autotuning to a single, cheapest config
-    (else per-run autotune is itself a non-determinism source). Pure-Python; no GPU."""
+    """Deterministic mode must collapse Triton autotuning to a single, cheapest config —
+    the mechanism that makes the scan reproducible. Pure-Python; no GPU."""
 
     class _Cfg:
         def __init__(self, block, warps, stages):
@@ -186,7 +170,6 @@ def test_autotune_configs_deterministic_selection():
             self.num_stages = stages
 
     configs = [_Cfg(64, 4, 2), _Cfg(32, 2, 1), _Cfg(128, 8, 3)]
-    # Neutralize the env knobs so we exercise the default cheapest-config path.
     saved = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("TRITON_AUTOTUNE_")}
     cache = os.environ.pop("TRITON_CACHE_AUTOTUNING", None)
     try:
@@ -198,7 +181,7 @@ def test_autotune_configs_deterministic_selection():
         ssd_det.set_deterministic_mode(True)
         picked = ssd_det.autotune_configs(list(configs))
         assert len(picked) == 1, "deterministic mode must collapse autotune to one config"
-        # cheapest = min(block_product * stages, then warps) → _Cfg(32, 2, 1).
+        # cheapest = min(block_product * stages, then warps) -> _Cfg(32, 2, 1).
         assert picked[0].kwargs["BLOCK_SIZE_M"] == 32
     finally:
         ssd_det.set_deterministic_mode(None)
@@ -208,20 +191,21 @@ def test_autotune_configs_deterministic_selection():
 
 
 def _worker() -> None:
-    """torchrun child (TP=_TP): run the scan on this rank's head-shard, all-reduce the
-    fingerprint across the TP group, and print it once from rank 0."""
+    """torchrun child: run the scan on this rank's head-shard at the SSD_DET setting,
+    all-reduce the fingerprint across the TP group, and print it once from rank 0."""
     import torch.distributed as dist
 
     rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
     try:
-        ssd_det.set_deterministic_mode(True)
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        # Per-rank seed → each TP shard gets distinct but reproducible data (same across
-        # the two jobs being compared). all-reduce combines the shards into one number.
-        a, b = _scan_output_fingerprint(nheads=_NHEADS_LOCAL, seed=_SEED + rank)
+        deterministic = os.environ.get("SSD_DET", "1") == "1"
+        ssd_det.set_deterministic_mode(deterministic)
+        torch.use_deterministic_algorithms(deterministic, warn_only=True)
+        nheads_local = _NHEADS_TOTAL // world  # a55b: heads sharded across TP
+        a, b = _scan_output_fingerprint(nheads=nheads_local, seed=_SEED + rank)
         fp = torch.tensor([a, b], dtype=torch.float64, device="cuda")
         dist.all_reduce(fp, op=dist.ReduceOp.SUM)
         if rank == 0:
