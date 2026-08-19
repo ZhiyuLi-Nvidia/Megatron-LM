@@ -37,10 +37,19 @@ Selected by `torch.are_deterministic_algorithms_enabled()` or
 | MoE routing map and probabilities | `megatron/core/transformer/moe/moe_utils.py` | `index_put_(accumulate=False)` row-wise writes | out-of-place `scatter` |
 | Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | direct indexing `weight[idx]` (deterministic backward) | `F.embedding` (non-deterministic atomic backward) |
 | Gated-delta-net kernel | `megatron/core/ssm/gated_delta_net.py` | torch `chunk_gated_delta_rule` | FLA fused kernel |
-| Gated-delta-net causal conv1d | `megatron/core/ssm/gated_delta_net.py` | `F.conv1d` (plus transposes) | FLA `causal_conv1d` |
+| Gated-delta-net causal conv1d | `megatron/core/ssm/gated_delta_net/` | `F.conv1d` (plus transposes) | FLA `causal_conv1d` |
 | Mamba/SSM Triton ops | `megatron/core/ssm/ops/common/determinism.py` | one fixed autotune config plus a zero-initialized tiled workspace reduced with an ordered `sum` | timing-based autotune, uninitialized workspace |
+| Mamba/GDP causal conv1d | `megatron/core/ssm/causal_conv1d.py` (checked at mixer construction) | causal_conv1d >= 1.6.0 reduces the conv weight and bias gradients through a per-block workspace and an ordered `sum` | `atomicAdd` accumulation, whose order varies from launch to launch |
 | Transformer Engine attention | `megatron/core/extensions/transformer_engine.py` | requires `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`, under which TE selects only backends that support deterministic execution (including deterministic FlashAttention backward) | TE picks freely, including atomic-accumulation attention backward |
 | Inference DP scheduling and RL rollout order | `megatron/core/inference/engines/dynamic_engine.py`, `megatron/rl/rl_utils.py` | sort by stable key | completion order |
+
+The two conv rows resolve the same problem differently on purpose. Mamba and GDP
+call Dao-AILab's `causal_conv1d`, which has a deterministic reduction of its own;
+gated-delta-net binds FLA's `causal_conv1d`, a different Triton kernel that
+`CAUSAL_CONV1D_DETERMINISTIC` does not control, so it still falls back to
+`F.conv1d` — and pays roughly ten times the deterministic kernel's device time
+for it. Giving FLA's kernel the same treatment would let that row converge on
+the first one.
 
 The following environment controls make the rest of the step deterministic.
 The flag `--deterministic-mode` validates and defaults these settings. For
@@ -51,6 +60,10 @@ details, refer to `megatron/training/determinism.py`.
 - `CUBLAS_WORKSPACE_CONFIG=:4096:8` (or `:16:8`).
 - `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`.
 - `MAMBA_DETERMINISTIC` must not be disabled.
+- `CAUSAL_CONV1D_DETERMINISTIC` must not be disabled. Unset is correct: the
+  kernel then follows `torch.use_deterministic_algorithms`. The Mamba and GDP
+  mixers refuse to build if a deterministic run would get a conv that cannot
+  deliver it — an install older than causal_conv1d 1.6.0, or an explicit `0`.
 
 ## Operations Without Determinism Support
 
@@ -76,6 +89,16 @@ hotspots are:
 - The sorted router top-k
 - Attention backward
 - Grouped-GEMM weight gradient (wgrad)
+
+The SSM causal conv1d is not one of them. It trades `atomicAdd` contention on
+`dweight` for a workspace and one `sum`, so it costs a fixed few microseconds at
+low occupancy and *saves* time once enough blocks are contending — between +24%
+and -25% of the convolution's device time across the shapes measured, against a
+channel-last layout that is already several times cheaper than the
+channels-first alternative it replaced. Measurements, the mechanism and the
+repro command are in
+[`causal-conv1d-overhead.md`](./causal-conv1d-overhead.md), which is the single
+source for those numbers.
 
 Reducing this cost is a tracked workstream in
 [issue #5785](https://github.com/NVIDIA/Megatron-LM/issues/5785). A change to

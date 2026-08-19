@@ -6,6 +6,10 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.ssm import causal_conv1d as causal_conv1d_module
+from megatron.core.ssm.causal_conv1d import (
+    CAUSAL_CONV1D_DETERMINISTIC_MIN_VERSION,
+    assert_causal_conv1d_deterministic,
+)
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -14,6 +18,11 @@ try:
     HAVE_CAUSAL_CONV1D = True
 except ImportError:
     HAVE_CAUSAL_CONV1D = False
+
+HAVE_DETERMINISTIC_CAUSAL_CONV1D = (
+    HAVE_CAUSAL_CONV1D
+    and causal_conv1d_module.is_causal_conv1d_min_version(CAUSAL_CONV1D_DETERMINISTIC_MIN_VERSION)
+)
 
 
 def _contiguous_slice(tensor, cp_rank, local_seq_len):
@@ -151,3 +160,211 @@ def test_causal_conv1d_channel_contiguous_matches_sequence_contiguous(dtype):
     torch.testing.assert_close(
         dbias_channel, dbias_sequence, rtol=param_grad_rtol, atol=param_grad_atol
     )
+
+
+GRAD_NAMES = ("dx", "dweight", "dbias")
+
+
+def _channel_last_conv_inputs(batch, dim, seq_len, width):
+    """Build a channel-last [B, D, L] conv input plus weight, bias and an output gradient."""
+    torch.manual_seed(7)
+    x = (
+        torch.randn(batch, seq_len, dim, device="cuda", dtype=torch.bfloat16)
+        .transpose(1, 2)
+        .detach()
+        .requires_grad_()
+    )
+    assert x.stride(1) == 1, "these tests are about the channel-last kernel"
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float32, requires_grad=True)
+    bias = torch.randn(dim, device="cuda", dtype=torch.float32, requires_grad=True)
+    grad = torch.randn(batch, seq_len, dim, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    return x, weight, bias, grad
+
+
+def _conv_backward(x, weight, bias, grad):
+    out = causal_conv1d_fn(x=x, weight=weight, bias=bias, activation="silu")
+    return torch.autograd.grad(out, (x, weight, bias), grad_outputs=grad)
+
+
+def _replay_channel_last_backward(batch, dim, seq_len, width, replays):
+    """Run one channel-last backward `replays` times from identical inputs.
+
+    Returns, per gradient, how many replays differed from the first bitwise.
+    """
+    inputs = _channel_last_conv_inputs(batch, dim, seq_len, width)
+    first, differing = None, dict.fromkeys(GRAD_NAMES, 0)
+    for _ in range(replays):
+        got = _conv_backward(*inputs)
+        if first is None:
+            first = got
+            continue
+        for name, ref, cur in zip(GRAD_NAMES, first, got):
+            differing[name] += not torch.equal(ref, cur)
+    return differing
+
+
+@pytest.mark.skipif(
+    not HAVE_DETERMINISTIC_CAUSAL_CONV1D,
+    reason=f"needs causal_conv1d >= {CAUSAL_CONV1D_DETERMINISTIC_MIN_VERSION}",
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_channel_last_conv1d_backward_replays_bitwise(monkeypatch, deterministic):
+    """The channel-last backward replays bit-for-bit only under the deterministic reduction.
+
+    Both halves matter. ``deterministic=True`` is the property GDP's channel-last conv relies
+    on; ``deterministic=False`` is its control, without which a build that quietly ignored
+    ``CAUSAL_CONV1D_DETERMINISTIC`` would still pass. The control is an assertion about the
+    *hardware's* scheduling, so it is sized with margin: the default path reduces each
+    ``dweight`` element with ``atomicAdd`` over ``batch * ceil(seq_len / 128)`` blocks -- 64 of
+    them here -- and 19 of 19 replays differed on GB300 at a shape with only 16. ``dx`` is
+    written by disjoint stores, so it is reproducible either way.
+
+    The env var is read by ``getenv`` on each backward call, so setting it here is enough; it
+    does not have to be in place before the extension loads.
+    """
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1" if deterministic else "0")
+    replays = 8
+    differing = _replay_channel_last_backward(
+        batch=2, dim=1024, seq_len=4096, width=4, replays=replays
+    )
+
+    assert differing["dx"] == 0
+    if deterministic:
+        assert differing["dweight"] == 0 and differing["dbias"] == 0
+    else:
+        assert differing["dweight"] > 0, (
+            f"the default channel-last backward was bit-reproducible over {replays} replays. "
+            "Either upstream made it deterministic -- in which case drop this control -- or "
+            "this GPU serialized the contending blocks, which the shape above is meant to "
+            "prevent."
+        )
+
+
+@pytest.mark.skipif(
+    not HAVE_DETERMINISTIC_CAUSAL_CONV1D,
+    reason=f"needs causal_conv1d >= {CAUSAL_CONV1D_DETERMINISTIC_MIN_VERSION}",
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_deterministic_reduction_agrees_with_the_default_one(monkeypatch):
+    """The deterministic path must reorder the same sum, not compute a different one.
+
+    Both paths derive identical per-block partials -- the kernel branches only on where a
+    partial is written, an `atomicAdd` into `dweight` versus a slot of its own in a workspace
+    that is summed afterwards. So the two results may differ, but only by fp32 accumulation
+    error: anything larger would mean the deterministic branch changed the arithmetic, which
+    no amount of bitwise self-consistency would catch.
+
+    Bitwise equality is the wrong bar here, since fp32 addition is not associative. The bar is
+    the gap relative to each tensor's own magnitude: measured at 5.6e-07 for `dweight` and
+    4.3e-07 for `dbias` on GB300 over batch 1-4 and seqlen 4096-8192, a few fp32 ulps (eps is
+    1.2e-07). The bound below is 1e-5, roughly 18x that.
+
+    Deliberately `rtol=0` with the whole tensor's magnitude in `atol`, not a per-element
+    relative bound. Per element the gap reaches ~1e-2, because a `dweight` entry near zero is
+    a near-total cancellation of much larger products, so its relative error is large while
+    its absolute error stays at the same few-ulp level. The cost of that choice is that this
+    would not catch a path corrupting only entries far below the tensor maximum; see
+    `docs/developer/determinism/causal-conv1d-overhead.md`.
+
+    `dx` never goes through the reduction and is expected to match bitwise.
+    """
+    inputs = _channel_last_conv_inputs(batch=2, dim=1024, seq_len=4096, width=4)
+
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "0")
+    default = _conv_backward(*inputs)
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    deterministic = _conv_backward(*inputs)
+
+    for name, ref, got in zip(GRAD_NAMES, default, deterministic):
+        if name == "dx":
+            assert torch.equal(ref, got), "dx does not go through the reduction"
+            continue
+        torch.testing.assert_close(
+            got,
+            ref,
+            rtol=0,
+            atol=float(ref.abs().max()) * 1e-5,
+            msg=f"{name} moved by more than fp32 accumulation error",
+        )
+
+
+@pytest.mark.skipif(not HAVE_CAUSAL_CONV1D, reason="causal_conv1d is not installed")
+def test_assert_causal_conv1d_deterministic_rejects_a_disabled_kernel(monkeypatch):
+    """deterministic_mode must not run against a conv that was explicitly switched off."""
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "0")
+    with pytest.raises(AssertionError, match="deterministic causal_conv1d backward"):
+        assert_causal_conv1d_deterministic(deterministic_mode=True)
+    # Nothing to enforce when the run never asked for determinism.
+    assert_causal_conv1d_deterministic(deterministic_mode=False)
+
+
+@pytest.mark.skipif(
+    not HAVE_DETERMINISTIC_CAUSAL_CONV1D,
+    reason=f"needs causal_conv1d >= {CAUSAL_CONV1D_DETERMINISTIC_MIN_VERSION}",
+)
+def test_assert_causal_conv1d_deterministic_accepts_an_enabled_kernel(monkeypatch):
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    assert_causal_conv1d_deterministic(deterministic_mode=True)
+
+
+def test_assert_causal_conv1d_deterministic_ignores_torch_flag_alone(monkeypatch):
+    """Torch's global flag is not a request for Megatron determinism, so it must not gate here.
+
+    Several unit tests call ``torch.use_deterministic_algorithms(True)`` and never restore it.
+    Treating that as a licence to reject an older causal_conv1d would fail model construction
+    for runs that never asked for bit-exactness.
+
+    The two fakes are what give this teeth: they are exactly the state that makes the version
+    check fire, so the paired ``deterministic_mode=True`` call below must raise. Without the
+    early return the first call would raise too.
+    """
+    monkeypatch.delenv("CAUSAL_CONV1D_DETERMINISTIC", raising=False)
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+    monkeypatch.setattr(
+        causal_conv1d_module, "is_causal_conv1d_min_version", lambda *_args, **_kwargs: False
+    )
+
+    assert_causal_conv1d_deterministic(deterministic_mode=False)
+
+    with pytest.raises(AssertionError, match="no deterministic backward"):
+        assert_causal_conv1d_deterministic(deterministic_mode=True)
+
+
+def test_assert_causal_conv1d_deterministic_accepts_the_torch_flag_path(monkeypatch):
+    """The configuration ``--deterministic-mode`` actually produces must pass.
+
+    It leaves ``CAUSAL_CONV1D_DETERMINISTIC`` unset and calls
+    ``torch.use_deterministic_algorithms(True)``, so the guard has to resolve the kernel's mode
+    through the torch fallback rather than the env var. Every other test here sets the env var
+    explicitly, which would leave that fallback -- the production path -- unexercised: a
+    regression making it return False would abort every deterministic run at mixer
+    construction.
+    """
+    monkeypatch.delenv("CAUSAL_CONV1D_DETERMINISTIC", raising=False)
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+    monkeypatch.setattr(
+        causal_conv1d_module, "is_causal_conv1d_min_version", lambda *_args, **_kwargs: True
+    )
+    assert_causal_conv1d_deterministic(deterministic_mode=True)
+
+
+def test_assert_causal_conv1d_deterministic_rejects_the_torch_flag_being_off(monkeypatch):
+    """deterministic_mode without torch's flag and without the env var is not deterministic."""
+    monkeypatch.delenv("CAUSAL_CONV1D_DETERMINISTIC", raising=False)
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
+    with pytest.raises(AssertionError, match="deterministic causal_conv1d backward"):
+        assert_causal_conv1d_deterministic(deterministic_mode=True)
+
+
+def test_assert_causal_conv1d_deterministic_rejects_an_old_kernel(monkeypatch):
+    """An install predating the deterministic reduction fails closed rather than silently.
+
+    Faked rather than installed: the point is the branch, and the version is the only input.
+    """
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    monkeypatch.setattr(
+        causal_conv1d_module, "is_causal_conv1d_min_version", lambda *_args, **_kwargs: False
+    )
+    with pytest.raises(AssertionError, match="no deterministic backward"):
+        assert_causal_conv1d_deterministic(deterministic_mode=True)

@@ -62,6 +62,23 @@ ACCEPTED_ENV_VAR_VALUES: dict[str, frozenset[str]] = {
     "CUBLAS_WORKSPACE_CONFIG": frozenset({":4096:8", ":16:8"}),
 }
 
+# Env vars whose library already auto-follows ``torch.are_deterministic_algorithms_enabled()``
+# when they are unset, so leaving them alone is correct and only an explicit "off" needs
+# rejecting. Value maps to what a non-'1' setting would silently turn off. Requiring a leading
+# '1' is what makes an unrecognized value fail here rather than coast: the two libraries
+# disagree on what to do with one. Mamba's reader treats anything not starting with '1' as OFF,
+# while causal_conv1d only honours a leading '1' or '0' and otherwise falls through to torch.
+# So `=true` would silently disable Mamba determinism and silently keep the conv's.
+#   - ``MAMBA_DETERMINISTIC``: ``megatron/core/ssm/ops/common/determinism.py``.
+#   - ``CAUSAL_CONV1D_DETERMINISTIC``: ``megatron/core/ssm/causal_conv1d.py``. causal_conv1d
+#     >= 1.6.0 reduces the conv weight and bias gradients through a per-block workspace and an
+#     ordered sum instead of atomicAdd. Needed by both SSM conv layouts, and needed at every
+#     micro-batch size for the channel-last one.
+AUTO_FOLLOWING_DETERMINISM_ENV_VARS: dict[str, str] = {
+    "MAMBA_DETERMINISTIC": "Mamba SSM Triton determinism",
+    "CAUSAL_CONV1D_DETERMINISTIC": "causal_conv1d convolution determinism",
+}
+
 
 def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     """Validate every determinism env var in ``env``, then setdefault the canonical values.
@@ -72,8 +89,9 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
       :data:`ACCEPTED_NCCL_ALGO_TOKENS`.
     * ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` / ``CUBLAS_WORKSPACE_CONFIG`` —
       if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
-    * ``MAMBA_DETERMINISTIC`` — if set (non-empty), must start with ``'1'``;
-      unset auto-follows :func:`torch.are_deterministic_algorithms_enabled`.
+    * every key of :data:`AUTO_FOLLOWING_DETERMINISM_ENV_VARS` — if set
+      (non-empty), must start with ``'1'``; unset auto-follows
+      :func:`torch.are_deterministic_algorithms_enabled`.
 
     After validation, ``setdefault`` fills every key in
     :data:`DETERMINISM_ENV_VAR_DEFAULTS` that has not been set — a value the
@@ -100,14 +118,14 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
             f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
         )
 
-    # Mamba SSM auto-follows torch when MAMBA_DETERMINISTIC is unset; only
-    # reject an explicit non-deterministic override.
-    mamba = env.get("MAMBA_DETERMINISTIC")
-    if mamba:
-        assert mamba[0] == "1", (
-            f"MAMBA_DETERMINISTIC={mamba!r} disables Mamba SSM determinism under "
-            "--deterministic-mode. Unset it or set to '1'."
-        )
+    # These auto-follow torch when unset; only reject an explicit non-deterministic override.
+    for name, what in AUTO_FOLLOWING_DETERMINISM_ENV_VARS.items():
+        val = env.get(name)
+        if val:
+            assert val[0] == "1", (
+                f"{name}={val!r} disables {what} under --deterministic-mode. "
+                "Unset it or set to '1'."
+            )
 
     # setdefault preserves any launcher-set value that just passed validation.
     for k, v in DETERMINISM_ENV_VAR_DEFAULTS.items():
@@ -123,9 +141,10 @@ def apply_determinism_to_args(args) -> None:
        its required value. This is a verification-only check — it never
        mutates ``args``.
     2. Calls :func:`apply_determinism_env` on ``os.environ`` — validates
-       every determinism-relevant env var (``NCCL_ALGO``,
-       ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``, ``CUBLAS_WORKSPACE_CONFIG``,
-       ``MAMBA_DETERMINISTIC``) and setdefaults the canonical values.
+       every determinism-relevant env var (``NCCL_ALGO``, the keys of
+       :data:`ACCEPTED_ENV_VAR_VALUES` and of
+       :data:`AUTO_FOLLOWING_DETERMINISM_ENV_VARS`) and setdefaults the
+       canonical values.
     3. Calls ``torch.use_deterministic_algorithms(True)``.
 
     Incompatible options are rejected with an explicit error rather than

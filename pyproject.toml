@@ -133,7 +133,9 @@ te = [
 
 ssm = [
     "mamba-ssm",
-    "causal-conv1d~=1.5",
+    # >=1.6 for the deterministic conv backward that --deterministic-mode requires; enforced by
+    # megatron/core/ssm/causal_conv1d.py. The lock already resolves 1.6.2.post1.
+    "causal-conv1d~=1.6",
 ]
 
 [dependency-groups]

@@ -21,6 +21,9 @@ This reference includes:
 - [`op-catalog.md`](./op-catalog.md): operations with a deterministic code path,
   operations that deterministic mode does not support, and the goal to shrink
   the unsupported set while speeding up the supported set
+- [`causal-conv1d-overhead.md`](./causal-conv1d-overhead.md): how the SSM
+  convolution's deterministic backward works, what it costs in time and memory,
+  and how to reproduce both
 - [`glossary.md`](./glossary.md): definitions and abbreviations
 
 The roadmap is tracked dynamically in
