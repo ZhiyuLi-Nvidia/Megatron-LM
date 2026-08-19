@@ -13,8 +13,11 @@ The same weight is quantized from two different sources, which is the whole bug:
                 -> transformer_engine cast_master_weights_to_fp8(model_params, main_params, ...)
                                                                               ^^^ fp32 MASTER
 
-  save          dist_checkpointing/utils.py:236  force_all_tensors_to_non_fp8
-                stores the weight DEQUANTIZED TO BF16, and stores no scale
+  save          dist_checkpointing/strategies/filesystem_async.py:146-161
+                _clone_or_dequantize_if_needed, inside prepare_write_data, calls .dequantize()
+                on quantized CUDA tensors ("a workaround to avoid the issue of quantized
+                tensors not being supported by the async writer"). No scale is stored:
+                `grep -r scale_inv megatron/core/dist_checkpointing/` returns nothing.
 
   load          the stored BF16 is written into the fp8 parameter, which REQUANTIZES --
                 recomputing the block scale from the BF16 copy, not from the master.
