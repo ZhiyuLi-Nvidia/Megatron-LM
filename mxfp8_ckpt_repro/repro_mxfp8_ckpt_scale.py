@@ -91,12 +91,23 @@ def main():
     n_sc = int((live_scale != res_scale).sum())
     print(f"weight values differing after save->load : {n_val}/{live_vals.numel()}")
     print(f"block scales differing after save->load  : {n_sc}/{live_scale.numel()}")
+
+    # The GAP, not the count: how far did the numbers actually move?
+    d = (res_vals - live_vals).abs()
+    denom = live_vals.abs().clamp_min(torch.finfo(torch.float32).tiny)
+    rel = d / denom
+    print(f"  value gap : max|abs|={d.max():.6e}  max|rel|={rel.max():.6e}  "
+          f"mean|rel|={rel.mean():.6e}")
+    sd = (res_scale - live_scale).abs()
+    srel = sd / live_scale.abs().clamp_min(torch.finfo(torch.float32).tiny)
+    # E8M0 codes: a delta of 1 code == a factor of 2 in the actual scale.
+    print(f"  scale gap : max|code delta|={sd.max():.0f}  max|rel code|={srel.max():.6e}  "
+          f"=> actual scale factor 2^{int(sd.max())}")
     if n_sc:
         d = (res_scale - live_scale)[live_scale != res_scale]
         print(f"  scale code delta min={d.min():.0f} max={d.max():.0f}  "
               f"finer={int((d < 0).sum())} coarser={int((d > 0).sum())}")
-        print("  (E8M0: a LOWER code is a FINER scale, which lowers the block ceiling")
-        print("   448*scale and can force top-magnitude elements to clamp)")
+        print("  (E8M0: scale = 2**(code-127), so a delta of 1 code is a FACTOR OF 2 in scale)")
 
     print()
     if n_val:
@@ -104,7 +115,8 @@ def main():
     elif n_sc:
         print("REPRODUCED (scale): the block scale is recomputed differently at load.")
         print("Values survive at this size because both scales represent them exactly;")
-        print("value loss appears once a block's amax exceeds 448*scale. See README.md.")
+        print("value changes do appear at model scale (63/136 tensors) by a mechanism that is")
+        print("not yet established -- see README.md, 'What is not known'.")
     else:
         print("not reproduced on this build")
     return 1 if (n_val or n_sc) else 0

@@ -58,9 +58,8 @@ This is the whole defect. The same weight's scale is derived from two different 
    136/136 MXFP8 params on the model-scale run, 56/56 in the standalone repro, every one by exactly
    **one E8M0 exponent**.
 
-6. **A finer scale lowers the block ceiling.** MXFP8 represents at most `448 * scale` in a block, so
-   halving the scale halves the ceiling. Where that ceiling drops below the block's own `amax`, the
-   top-magnitude elements **clamp** — and the weight changes. Measured: **63/136**.
+6. **Weights do change** — 63/136 MXFP8 tensors at model scale, 782/782 at 64 GPUs. **How** the
+   re-encoding turns into a value change is NOT established; see "What is not known" below.
 
 7. **Different weights at the resumed step → different forward → the trajectory diverges.**
 
@@ -85,7 +84,8 @@ block scales differing after save->load  : 56/1024
 
 Every differing scale moves by exactly one exponent, always finer, never coarser — a systematic
 bias between two computations, not tie-breaking noise. Values survive at this size because both
-scales represent these particular values exactly; loss appears once `amax` exceeds `448 * scale`.
+scales represent these particular values exactly. Value changes do appear at model scale
+(63/136 tensors), by a mechanism that is not yet established -- see "What is not known".
 
 ## Evidence
 
@@ -135,12 +135,33 @@ avoid.
 
 ---
 
-## Caveats
+## What is not known
 
-- The chain in steps 5–6 (finer scale → clamping → value change) is inferred from the code path plus
-  the measurements above, which all agree with it. Nobody has stepped inside
-  `cast_master_weights_to_fp8` to watch the exponent being selected — that is a TransformerEngine
-  read and is the one unverified link.
+**How the re-encoding becomes a value change is unexplained.** An earlier draft claimed clamping:
+a finer scale lowers the block ceiling `448 * scale`, so top-magnitude elements exceed it and clamp.
+**That was measured and refuted.** On the real save/load path at model scale, dumping the 16
+largest-magnitude values of every parameter at full precision:
+
+```
+MXFP8 tensors compared: 544, value-hash differing: 231
+top-16 elements that actually moved: 0
+```
+
+Not one top-magnitude element moved in any of the 231 tensors whose values differ. Clamping can only
+affect top-magnitude elements, so nothing clamped. This is corroborated by the aggregates: `absmax`,
+`mean` and `abs-sum` are identical to **17 significant digits** on every value-differing tensor,
+which a clamp of that kind could not leave untouched.
+
+So the value differences are real but live in the smaller magnitudes, and **no maximum relative gap
+has been measured** — the probe sampled the top of each tensor, which is where the loss turned out
+not to be.
+
+Also unverified: nobody has stepped inside `cast_master_weights_to_fp8` to watch the exponent being
+selected. That is a TransformerEngine read.
+
+**What is solid:** the scale is not stored, is recomputed on load from a different source than a
+running job uses, and comes back uniformly one E8M0 exponent finer — 136/136 and 56/56, never once
+coarser. And the weights differ after a resume. The link between those two facts is not yet proven.
 - An earlier draft of this document cited `dist_checkpointing/utils.py:236`
   `force_all_tensors_to_non_fp8` as the save-side dequantize. That was **wrong**: it is called from
   `serialization.py:135` inside `def load(...)` and dequantizes the *destination* state dict on
