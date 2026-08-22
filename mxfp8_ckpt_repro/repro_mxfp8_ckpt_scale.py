@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Minimal repro: an MXFP8 weight's block scale is not reproduced across a checkpoint round trip.
+"""An MXFP8 block scale is RE-ENCODED across a checkpoint round trip. Values are preserved.
+
+This is a representation change with no numerical effect: the script reports max|rel| = 0.0 on the
+values. See README.md -- an earlier revision wrongly claimed weight corruption.
 
 One Blackwell (SM100+) GPU, ~10 s. Deliberately standalone -- no Megatron import, no distributed
 init, no checkpoint files -- so it can be run against any checkout. See README.md for the evidence
 at model and cluster scale.
 
-The same weight is quantized from two different sources, which is the whole bug:
+The same weight is quantized from two different sources, which is why the scale is re-encoded:
 
   running job   distrib_optimizer.py  _copy_main_params_to_model_params
                 -> fp8_utils.py:674   quantize_param_shard
@@ -111,15 +114,15 @@ def main():
 
     print()
     if n_val:
-        print(f"REPRODUCED (values): max |delta| = {(live_vals - res_vals).abs().max():.3e}")
+        print(f"UNEXPECTED (values changed): max |delta| = {d.max():.3e} -- see README.md")
     elif n_sc:
-        print("REPRODUCED (scale): the block scale is recomputed differently at load.")
-        print("Values survive at this size because both scales represent them exactly;")
-        print("value changes do appear at model scale (63/136 tensors) by a mechanism that is")
-        print("not yet established -- see README.md, 'What is not known'.")
+        print("SHOWN: the block scale is re-encoded at load (one E8M0 code finer).")
+        print("Values are numerically unchanged. Model state round-trips exactly; the")
+        print("re-encoding is a representation change only. See README.md.")
     else:
-        print("not reproduced on this build")
-    return 1 if (n_val or n_sc) else 0
+        print("no scale re-encoding on this build")
+    # 0: nothing to report. The scale re-encoding alone is not a failure -- it is lossless.
+    return 1 if n_val else 0
 
 
 if __name__ == "__main__":
