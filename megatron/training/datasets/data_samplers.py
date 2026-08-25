@@ -108,6 +108,18 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {"collate_fn": lambda x: x,}
     else:
         extra_kwargs = {}
+    # Own generator, so building the iterator never draws from the global CPU RNG:
+    # _BaseDataLoaderIter seeds `_base_seed` from `loader.generator`, or from the default generator
+    # when that is None. pretrain() loads the checkpoint in setup_model_and_optimizer, BEFORE
+    # build_train_valid_test_data_iterators, so a resumed run spends that draw AFTER restoring the
+    # saved CPU RNG state while a continuous run spent it before saving -- leaving the two with
+    # different CPU RNG states from the first resumed step onward.
+    #
+    # torch.initial_seed() reads the default generator's seed WITHOUT consuming a draw, so this
+    # inherits _set_random_seed's per-rank derivation (including its explicit-group path for
+    # disjoint grids) rather than re-deriving it here and drifting if that formula changes.
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(torch.initial_seed())
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -115,6 +127,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
+        generator=loader_generator,
         **extra_kwargs,
     )
 
