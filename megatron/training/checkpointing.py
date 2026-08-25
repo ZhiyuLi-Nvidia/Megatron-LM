@@ -485,22 +485,35 @@ def get_rng_state(
     else:
         rng_state_list = [rng_state]
 
-    dp_cp_rank = (
-        get_pg_rank(dp_cp_group)
-        if dp_cp_group is not None
-        else mpu.get_data_parallel_rank(with_context_parallel=True)
-    )
     if ckpt_format == 'torch_dist':
-        pp_rank = get_pg_rank(pp_group)
-        pp_size = get_pg_size(pp_group)
-        tp_rank = get_pg_rank(tp_group)
-        tp_size = get_pg_size(tp_group)
+        # Shard the RNG state by GLOBAL RANK.
+        #
+        # The cuda_rng_tracker streams are seeded per rank (tensor_parallel/random.py), e.g.
+        #     expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
+        # Sharding over (pp, tp) with replica_id=dp_cp_rank made every other parallel axis -- ep,
+        # etp, and any rematerialization ranks -- a REPLICA: one rank's tracker state was written
+        # and all of its peers restored it. Only expert-parallel rank 0 then resumed with the
+        # stream it had saved. Any consumer of those streams (MoE routing under
+        # --moe-router-force-load-balancing, expert-parallel dropout) therefore diverges from the
+        # first resumed step, while a run-to-run A/A stays bit-identical -- so the divergence looks
+        # like a checkpoint bug rather than nondeterminism, which is what it is.
+        #
+        # Adding those axes individually does not work: the rematerialization ranks are not
+        # independent of ep_rank, so the tuple space is not covered and the save fails validation
+        # with "Invalid access pattern: N ShardedObject are missing". Global rank is always exact --
+        # every rank writes its own state and nothing is a replica.
+        #
+        # Trade-off: the payload becomes world_size copies (a few KB each) and the RNG state can no
+        # longer be resharded onto a different world size. The previous scheme could not reshard
+        # these trackers correctly either; it silently restored another rank's stream instead of
+        # failing. Checkpoints written before this change carry 2-D (pp, tp) shards and will not
+        # match a 1-D request; that fails loudly at load rather than silently.
         rng_state_list = ShardedObject(
             f'{key_prefix}rng_state',
             rng_state_list,
-            (pp_size, tp_size),
-            (pp_rank, tp_rank),
-            replica_id=dp_cp_rank,
+            (torch.distributed.get_world_size(),),
+            (torch.distributed.get_rank(),),
+            replica_id=0,
         )
     elif ckpt_format == 'fsdp_dtensor':
         pp_rank = get_pg_rank(pp_group)
