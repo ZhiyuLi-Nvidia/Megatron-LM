@@ -459,7 +459,7 @@ def get_rng_state(
     """Collect rng state across data parallel ranks.
 
     dp_group threads the data-parallel group used for RNG gather/indexing.
-    dp_cp_group threads the data-parallel (with context-parallel) group used for checkpoint replica id.
+    dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
     args = get_args()
@@ -485,24 +485,32 @@ def get_rng_state(
     else:
         rng_state_list = [rng_state]
 
-    dp_cp_rank = (
-        get_pg_rank(dp_cp_group)
+    dp_cp_group = (
+        dp_cp_group
         if dp_cp_group is not None
-        else mpu.get_data_parallel_rank(with_context_parallel=True)
+        else mpu.get_data_parallel_group(with_context_parallel=True)
     )
+    dp_cp_rank = get_pg_rank(dp_cp_group)
     if ckpt_format == 'torch_dist':
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
+        # The cuda_rng_tracker streams are seeded per rank (tensor_parallel/random.py), so any
+        # axis missing from the key becomes a replica and those ranks restore a peer's stream --
+        # which is what the old (pp, tp) key with replica_id=dp_cp_rank did to expert parallelism.
+        # ep/etp/gtp_remat cannot be added as separate axes because they are interdependent and do
+        # not tile the grid; pp x tp x dp_cp does, and determines all of them.
+        dp_cp_size = get_pg_size(dp_cp_group)
         rng_state_list = ShardedObject(
             f'{key_prefix}rng_state',
             rng_state_list,
-            (pp_size, tp_size),
-            (pp_rank, tp_rank),
-            replica_id=dp_cp_rank,
+            (pp_size, tp_size, dp_cp_size),
+            (pp_rank, tp_rank, dp_cp_rank),
         )
     elif ckpt_format == 'fsdp_dtensor':
+        # NOTE: this key omits dp_cp and has the same defect fixed above; fixing it also needs
+        # the matching lookup in load_checkpoint.
         pp_rank = get_pg_rank(pp_group)
         tp_rank = get_pg_rank(tp_group)
         rng_state_list = {f'({pp_rank}, {tp_rank})': rng_state_list}
@@ -2575,9 +2583,13 @@ def load_checkpoint(
             run_tp_pp, ckpt_tp_pp
         )
 
-        # Determine if RNG state will be loaded
+        # Determine if RNG state will be loaded.
+        # world_size must match, not just (TP, PP): the rng shard key includes dp_cp (see
+        # get_rng_state), so rescaling DP alone changes its shape and this rank has no shard to
+        # load. Fall back to the freshly seeded state, as a (TP, PP) change already does.
         if (
             ckpt_tp_pp == run_tp_pp
+            and ckpt_world_size == run_world_size
             and not release
             and not args.finetune
             and not args.no_load_rng
@@ -2599,6 +2611,11 @@ def load_checkpoint(
             gen_sd_rng_state = None
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0('{}: RNG state will be ignored'.format(mismatch_msg))
+            elif ckpt_world_size != run_world_size:
+                print_rank_0(
+                    'world size changed after resume ({} vs {} from checkpoint): '
+                    'RNG state will be ignored'.format(run_world_size, ckpt_world_size)
+                )
 
         if ckpt_type == CheckpointType.LOCAL:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
