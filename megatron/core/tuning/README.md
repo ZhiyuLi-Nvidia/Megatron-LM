@@ -110,6 +110,23 @@ uses the explicit deterministic-mode setter or PyTorch's deterministic flag and,
 if already installed, the policy's block sizes. An import-time singleton cannot
 later recover its discarded candidates.
 
+### cuTile linear-attention kernels (cudnn-frontend)
+
+The cuDNN frontend's cuTile engine for GDN and KDA (the engine Transformer
+Engine's `GatedDeltaNetAttention` reaches outside the FROST envelope) times
+`occupancy x num_worker_warps` launch candidates per process, and the
+worker-warp count changes the summation tree of the kernels that reduce with
+`ct.sum`. cudnn-frontend exposes two hooks on that launch
+(NVIDIA/cudnn-frontend#1735), and `megatron/core/tuning/cutile.py` binds them to
+the installed policy with the same modes, tables and diagnostics: `pinned` runs
+the table entry, or the sweep's first candidate (occupancy 1, 4 worker warps)
+when the table misses; `record` captures the timed winners into the same
+per-rank recording, so one `merge` builds a table that covers Triton and cuTile
+kernels alike; every choice is logged for the agreement check. Kernels are
+keyed by their qualified name (`cudnn.linear_attention.cutile.kernels.gdn.<kernel>`)
+and the launch's shape key, which carries no device. The scope prefix is `cudnn`.
+A cudnn-frontend without the hooks keeps its timed picks, with one warning.
+
 ## Modes and precedence
 
 | Mode | Behavior |
@@ -211,7 +228,7 @@ The training arguments are generated from `AutotunePolicy`: each field has a
 `--triton-autotune-<field>` argument (underscores become hyphens) whose help is
 the field's docstring, for example `--triton-autotune-on-miss error` or
 `--triton-autotune-verify-strict`. Tuple fields take several values
-(`--triton-autotune-modules mamba_ssm transformer_engine megatron.core my_package`),
+(`--triton-autotune-modules mamba_ssm transformer_engine megatron.core cudnn my_package`),
 `--triton-autotune-config-invariant` without names pins every kernel in scope,
 and `--triton-autotune-block-sizes` takes `NAME=VALUE` pairs such as
 `BLOCK_C=512 BLOCK_S=1`.
